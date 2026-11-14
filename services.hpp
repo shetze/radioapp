@@ -34,6 +34,18 @@
 #define ENGINE_HEALTH_EVENTGROUP_ID 0x4003
 #define ENGINE_HEALTH_EVENT_ID 0x8000 + 2
 
+// Simulated rear camera and ultrasonic sensor service. Camera frames are sent
+// over a reliable (TCP) SOME/IP event; the other two independent eventgroups
+// allow clients to subscribe to only the information they require.
+#define SENSORS_SERVICE_ID 0x1003
+#define SENSORS_INSTANCE_ID 1
+#define SENSORS_CAMERA_EVENTGROUP_ID 0x4005
+#define SENSORS_ULTRASONIC_EVENTGROUP_ID 0x4006
+#define SENSORS_CAMERA_STATUS_EVENTGROUP_ID 0x4007
+#define SENSORS_CAMERA_FRAME_EVENT_ID 0x8001
+#define SENSORS_ULTRASONIC_EVENT_ID 0x8002
+#define SENSORS_CAMERA_STATUS_EVENT_ID 0x8003
+
 static uint32_t inline
 payload_get_arg(std::shared_ptr<vsomeip::payload> its_payload)
 {

@@ -55,20 +55,21 @@ install -m 0644 auto-apps.pp %{buildroot}%{_datadir}/selinux/packages/automotive
 /usr/sbin/semodule -i %{_datadir}/selinux/packages/automotive/auto-apps.pp &> /dev/null || :
 
 # 2. Apply file contexts to affected directories/files
-/usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service &> /dev/null || :
+/usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service %{_bindir}/sensors-service &> /dev/null || :
 
 %postun selinux
 if [ $1 -eq 0 ]; then
     # If the package is completely uninstalled: remove module
     /usr/sbin/semodule -r auto-apps &> /dev/null || :
     # Reset context to default
-    /usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service &> /dev/null || :
+    /usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service %{_bindir}/sensors-service &> /dev/null || :
 fi
 
 %files
 %{_bindir}/engine-service
 %{_bindir}/radio-client
 %{_bindir}/radio-service
+%{_bindir}/sensors-service
 %{_datadir}/auto-apps/animations/
 
 %files selinux

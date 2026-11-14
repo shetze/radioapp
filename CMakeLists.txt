@@ -35,7 +35,8 @@ add_executable(radio-service radio-service.cpp services.hpp demo-health.hpp radi
 target_link_libraries(radio-service  vsomeip3 ${Boost_LIBRARIES})
 
 add_executable(radio-client radio-client.cpp radio-video.cpp radio-video.hpp
-               radio-client-state.hpp demo-health.hpp services.hpp)
+               radio-client-state.hpp demo-health.hpp services.hpp
+               sensors-protocol.hpp sensors-client-state.hpp)
 target_include_directories(radio-client PRIVATE ${CURSES_INCLUDE_DIRS} ${LIBCACA_INCLUDE_DIR})
 target_compile_definitions(radio-client PRIVATE
     RADIO_DEFAULT_VIDEO_DIR=\"${CMAKE_INSTALL_FULL_DATADIR}/auto-apps/animations\")
@@ -44,8 +45,12 @@ target_link_libraries(radio-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LIBRARI
 add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-demo-memory.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
+add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
+               sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp services.hpp)
+target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
+
 install (
-    TARGETS radio-service radio-client engine-service
+    TARGETS radio-service radio-client engine-service sensors-service
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
 
@@ -63,6 +68,10 @@ if(BUILD_TESTING)
     target_compile_definitions(radio-video-test PRIVATE
         VIDEO_DEMO_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/animations/city-traffic.ansi\")
     add_test(NAME radio-video-test COMMAND radio-video-test)
+    add_executable(sensors-test tests/sensors-test.cpp sensors-simulation.cpp
+                   sensors-protocol.hpp sensors-client-state.hpp sensors-activation.hpp)
+    target_include_directories(sensors-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME sensors-test COMMAND sensors-test)
     add_executable(demo-health-test tests/demo-health-test.cpp
                    demo-health.hpp engine-demo-memory.hpp radio-client-state.hpp)
     target_include_directories(demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

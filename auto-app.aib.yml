@@ -216,6 +216,10 @@ content:
             {
               "name": "Radio client",
               "id": "0x1002"
+            },
+            {
+              "name": "Sensors",
+              "id": "0x1003"
             }
           ],
           "services": [
@@ -228,6 +232,11 @@ content:
               "service": "0x1001",
               "instance": "0x01",
               "unreliable": "30509"
+            },
+            {
+              "service": "0x1003",
+              "instance": "0x01",
+              "reliable": "30511"
             }
           ],
           "service-discovery": {
@@ -344,6 +353,28 @@ qm:
           
           [Install]
           WantedBy=multi-user.target
+      - path: /etc/containers/systemd/sensors.container
+        text: |
+          [Unit]
+          Description=simulated rear camera and ultrasonic sensors (QM)
+          Requires=routingmanagerd.service
+          After=routingmanagerd.service
+
+          [Container]
+          Image=localhost/auto-apps
+          Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+          Volume=/run/vsomeip/:/run/vsomeip/
+          Volume=/run/dlt/:/run/dlt/
+          Volume=/run/ipc/:/run/ipc/
+          SecurityLabelType=qm_container_ipc_t
+          Network=host
+          Exec=/usr/bin/sensors-service
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
       - path: /etc/vsomeip.json
         text: |
           {
@@ -384,6 +415,10 @@ qm:
               {
                 "name": "Radio client",
                 "id": "0x1002"
+              },
+              {
+                "name": "Sensors",
+                "id": "0x1003"
               }
             ],
             "services": [
@@ -396,6 +431,11 @@ qm:
                 "service": "0x1001",
                 "instance": "0x01",
                 "unreliable": "30509"
+              },
+              {
+                "service": "0x1003",
+                "instance": "0x01",
+                "reliable": "30511"
               }
             ],
             "service-discovery": {

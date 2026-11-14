@@ -314,6 +314,7 @@ Player::Player(std::string directory) : directory_(std::move(directory)) {}
 void Player::browse() {
     animation_.reset();
     position_ = 0;
+    paused_ = false;
     const std::string previous = entries_.empty() ? "" : entries_[selection_].path;
     entries_ = discover(directory_, message_);
     selection_ = 0;
@@ -348,6 +349,7 @@ void Player::select(Time now) {
     }
     message_.clear();
     animation_ = std::move(animation);
+    paused_ = false;
     position_ = 0;
     next_frame_ = now + std::chrono::nanoseconds(1000000000LL / animation_->fps());
 }
@@ -355,11 +357,26 @@ void Player::select(Time now) {
 void Player::stop() {
     animation_.reset();
     position_ = 0;
+    paused_ = false;
     message_.clear();
 }
 
+void Player::pause(Time now) {
+    if (animation_ && !paused_) {
+        paused_ = true;
+        paused_at_ = now;
+    }
+}
+
+void Player::resume(Time now) {
+    if (animation_ && paused_) {
+        next_frame_ += now - paused_at_;
+        paused_ = false;
+    }
+}
+
 bool Player::advance(Time now) {
-    if (!animation_ || now < next_frame_)
+    if (!animation_ || paused_ || now < next_frame_)
         return false;
     const auto period = std::chrono::nanoseconds(1000000000LL / animation_->fps());
     const auto elapsed = now - next_frame_;
@@ -371,7 +388,7 @@ bool Player::advance(Time now) {
 }
 
 int Player::wait_ms(Time now) const {
-    if (!animation_)
+    if (!animation_ || paused_)
         return 100;
     if (now >= next_frame_)
         return 0;

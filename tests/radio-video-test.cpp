@@ -98,6 +98,14 @@ int main() {
     assert(player.advance(start + std::chrono::milliseconds(550)));
     assert(player.current_frame().index == 1); // skip frames if UI is delayed
     assert(!player.advance(start + std::chrono::milliseconds(551)));
+    player.pause(start + std::chrono::milliseconds(560));
+    assert(player.paused());
+    assert(!player.advance(start + std::chrono::milliseconds(5000)));
+    assert(player.wait_ms(start + std::chrono::milliseconds(5000)) == 100);
+    player.resume(start + std::chrono::milliseconds(5560));
+    assert(!player.paused());
+    assert(!player.advance(start + std::chrono::milliseconds(5561)));
+    assert(player.advance(start + std::chrono::milliseconds(5600)));
     player.stop();
     assert(!player.playing());
     player.move(500);

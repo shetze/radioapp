@@ -29,6 +29,7 @@
 
 #include "radio-client-state.hpp"
 #include "radio-video.hpp"
+#include "sensors-client-state.hpp"
 #include "services.hpp"
 #include "demo-health.hpp"
 
@@ -45,11 +46,14 @@ using radio_ui::StyledText;
 using radio_ui::TextColor;
 
 constexpr int kRefreshMs = 100;
+constexpr int kCameraRefreshMs = 33; // allows up to 30fps camera display
 constexpr int kMonitorMinRows = 16;
 
 std::shared_ptr<vsomeip::application> app;
 std::mutex state_mutex;
 ClientState state;
+std::mutex sensors_mutex;
+sensors::ClientView sensor_view;
 std::atomic<bool> running{true};
 
 // SOME/IP callbacks never call ncurses: the UI thread owns the terminal.
@@ -102,6 +106,38 @@ void on_radio_health_event(const std::shared_ptr<vsomeip::message> &event) {
     if (!demo_health::decode(payload->get_data(), payload->get_length(), message))
         return;
     update_state([&](ClientState &s) { s.radio_health_event(message); });
+}
+
+void on_sensor_availability(vsomeip::service_t, vsomeip::instance_t, bool available) {
+    std::lock_guard<std::mutex> lock(sensors_mutex);
+    sensor_view.availability(available);
+}
+
+void on_sensor_status(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    sensors::CameraStatus status;
+    if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), status))
+        return;
+    std::lock_guard<std::mutex> lock(sensors_mutex);
+    sensor_view.status(status, std::chrono::steady_clock::now());
+}
+
+void on_sensor_frame(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    sensors::CameraFrame frame;
+    if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), frame))
+        return;
+    std::lock_guard<std::mutex> lock(sensors_mutex);
+    sensor_view.frame(std::move(frame), std::chrono::steady_clock::now());
+}
+
+void on_sensor_ultrasonic(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    sensors::Ultrasonic ranges;
+    if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), ranges))
+        return;
+    std::lock_guard<std::mutex> lock(sensors_mutex);
+    sensor_view.ultrasonic(ranges, std::chrono::steady_clock::now());
 }
 
 void on_engine_health_event(const std::shared_ptr<vsomeip::message> &event) {
@@ -158,6 +194,27 @@ void request_engine_events() {
     app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
 }
 
+void request_sensor_events() {
+    app->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                                  SENSORS_CAMERA_STATUS_EVENT_ID, on_sensor_status);
+    app->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                                  SENSORS_CAMERA_FRAME_EVENT_ID, on_sensor_frame);
+    app->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                                  SENSORS_ULTRASONIC_EVENT_ID, on_sensor_ultrasonic);
+    for (const auto &binding : {
+            std::make_pair(SENSORS_CAMERA_STATUS_EVENT_ID, SENSORS_CAMERA_STATUS_EVENTGROUP_ID),
+            std::make_pair(SENSORS_CAMERA_FRAME_EVENT_ID, SENSORS_CAMERA_EVENTGROUP_ID),
+            std::make_pair(SENSORS_ULTRASONIC_EVENT_ID, SENSORS_ULTRASONIC_EVENTGROUP_ID)}) {
+        app->request_event(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                           static_cast<vsomeip::event_t>(binding.first),
+                           std::set<vsomeip::eventgroup_t>{
+                               static_cast<vsomeip::eventgroup_t>(binding.second)},
+                           vsomeip::event_type_e::ET_FIELD,
+                           vsomeip::reliability_type_e::RT_RELIABLE);
+        app->subscribe(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, binding.second);
+    }
+}
+
 bool setup_vsomeip() {
     app = vsomeip::runtime::get()->create_application("Radio client");
     if (!app || !app->init())
@@ -168,8 +225,12 @@ bool setup_vsomeip() {
                                        on_engine_availability);
     request_radio_events();
     request_engine_events();
+    app->register_availability_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                                       on_sensor_availability);
+    request_sensor_events();
     app->request_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
     app->request_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
+    app->request_service(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID);
     return true;
 }
 
@@ -312,13 +373,12 @@ public:
         refresh();
     }
 
-    // Radio/monitor and video never draw into each other's windows. Video
-    // owns a single full-screen ncurses WINDOW, including the browser UI.
-    void render_video(const radio_video::Player &player) {
-        int rows = 0, cols = 0;
+    // Video and camera share a single full-screen ncurses window and the
+    // same libcaca-canvas renderer. Neither SOME/IP callback touches curses.
+    bool begin_fullscreen(int &rows, int &cols) {
         getmaxyx(stdscr, rows, cols);
         if (rows <= 0 || cols <= 0)
-            return;
+            return false;
         if (!video_window_ || rows != video_rows_ || cols != video_cols_) {
             if (video_window_)
                 delwin(video_window_);
@@ -327,8 +387,15 @@ public:
             video_cols_ = cols;
         }
         if (!video_window_)
-            return;
+            return false;
         werase(video_window_);
+        return true;
+    }
+
+    void render_video(const radio_video::Player &player) {
+        int rows = 0, cols = 0;
+        if (!begin_fullscreen(rows, cols))
+            return;
         if (cols < radio_video::kMinimumColumns ||
             rows < radio_video::kMinimumRows) {
             video_line(0, "VIDEO  (X/V to return)", PairHeading, true);
@@ -337,6 +404,88 @@ public:
             draw_video_frame(player, rows, cols);
         } else {
             draw_video_library(player, rows, cols);
+        }
+        wnoutrefresh(video_window_);
+        doupdate();
+    }
+
+    void render_camera(const sensors::ClientView &view,
+                       std::chrono::steady_clock::time_point now) {
+        int rows = 0, cols = 0;
+        if (!begin_fullscreen(rows, cols))
+            return;
+        const sensors::CameraFrame *frame = view.fresh_frame(now);
+        if (cols < sensors::kMinCameraWidth || rows < sensors::kMinCameraHeight) {
+            video_line(1, "REAR CAMERA / REVERSE", PairWarning, true);
+            video_line(3, "Resize terminal to at least 100x30 characters", PairWarning);
+        } else if (!frame) {
+            video_line(1, "REAR CAMERA / REVERSE", PairHeading, true);
+            if (!view.online())
+                video_line(3, "SENSORS SERVICE UNAVAILABLE", PairError, true);
+            else if (view.camera_state(now) == sensors::CameraState::Fault)
+                video_line(3, "CAMERA UNAVAILABLE: ENGINE DIRECTION UNKNOWN", PairError, true);
+            else if (view.camera_state(now) == sensors::CameraState::Inactive)
+                video_line(3, "CAMERA STARTING / AWAITING REVERSE", PairWarning);
+            else if (view.camera_state(now) == sensors::CameraState::Unknown)
+                video_line(3, "CAMERA STATUS UNAVAILABLE OR STALE", PairError, true);
+            else
+                video_line(3, "NO FRESH CAMERA FRAMES", PairError, true);
+            video_line(5, "Old camera frames are never displayed as live video.", PairMuted);
+        } else if (cols < frame->width || rows < frame->height) {
+            video_line(1, "REAR CAMERA / REVERSE", PairHeading, true);
+            video_line(3, "Camera requires a terminal of at least " +
+                       std::to_string(frame->width) + "x" +
+                       std::to_string(frame->height), PairWarning);
+        } else {
+            // Reconstruct a libcaca canvas from safe, bounded on-wire cells.
+            // This is also the renderer used for locally loaded animations.
+            std::shared_ptr<caca_canvas_t> canvas(caca_create_canvas(frame->width, frame->height),
+                                                   &caca_free_canvas);
+            if (!canvas) {
+                video_line(3, "Camera render allocation failed", PairError);
+            } else {
+                std::uint8_t last_color = 0xff;
+                for (int y = 0; y < frame->height; ++y) {
+                    for (int x = 0; x < frame->width; ++x) {
+                        const auto &cell = frame->at(x, y);
+                        if (cell.colors != last_color) {
+                            caca_set_color_ansi(canvas.get(), cell.colors & 15,
+                                                (cell.colors >> 4) & 15);
+                            last_color = cell.colors;
+                        }
+                        caca_put_char(canvas.get(), x, y,
+                                      static_cast<unsigned char>(cell.glyph));
+                    }
+                }
+                draw_canvas(canvas.get(), frame->width, frame->height,
+                            (cols - frame->width) / 2, (rows - frame->height) / 2, cols);
+                const auto *ranges = view.fresh_ultrasonic(now);
+                if (rows > frame->height)
+                    video_line(0, "REAR CAMERA - SIMULATED     M Monitor     V Video     Q Quit",
+                               PairHeading, true);
+                if (ranges && ranges->valid_mask) {
+                    int minimum = 65536;
+                    auto distance = [&](int index) {
+                        if ((ranges->valid_mask & (1u << index)) == 0)
+                            return std::string("--");
+                        minimum = std::min(minimum, static_cast<int>(ranges->millimeters[index]));
+                        return std::to_string(ranges->millimeters[index]);
+                    };
+                    // Call in sensor order; an invalid reading is not a zero-distance alarm.
+                    const std::string left = distance(0);
+                    const std::string mid_left = distance(1);
+                    const std::string mid_right = distance(2);
+                    const std::string right = distance(3);
+                    const int color = minimum < 500 ? PairError :
+                                      minimum < 1500 ? PairWarning : PairGood;
+                    const int label_row = rows > frame->height ? rows - 1 : frame->height - 1;
+                    video_line(label_row, "REAR ULTRASONIC [mm]  L:" + left +
+                               " ML:" + mid_left + " MR:" + mid_right + " R:" + right,
+                               color, true);
+                } else {
+                    video_line(rows - 1, "ULTRASONIC DATA UNAVAILABLE / STALE", PairWarning);
+                }
+            }
         }
         wnoutrefresh(video_window_);
         doupdate();
@@ -449,20 +598,30 @@ private:
         caca_set_frame(frame.canvas.get(), frame.index);
         const int offset_x = (cols - animation->width()) / 2;
         const int offset_y = (rows - animation->height()) / 2;
+        draw_canvas(frame.canvas.get(), frame.width, frame.height,
+                    offset_x, offset_y, cols);
+        if (offset_y > 0) {
+            video_line(0, "VIDEO: " + player.entries()[player.selection()].name +
+                       "   X Stop   V Radio", PairMuted);
+        }
+    }
+
+    void draw_canvas(caca_canvas_t *canvas, int canvas_width, int canvas_height,
+                     int offset_x, int offset_y, int cols) {
         int last_attr = -1;
-        for (int y = 0; y < frame.height; ++y) {
-            for (int x = 0; x < frame.width; ++x) {
-                const std::uint32_t cp = caca_get_char(frame.canvas.get(), x, y);
+        for (int y = 0; y < canvas_height; ++y) {
+            for (int x = 0; x < canvas_width; ++x) {
+                const std::uint32_t cp = caca_get_char(canvas, x, y);
                 // libcaca marks the second cell of a wide character with
                 // an internal sentinel. ncursesw draws it automatically.
                 if (cp == CACA_MAGIC_FULLWIDTH || cp < 32 || cp > 0x10ffff)
                     continue;
                 const wchar_t wc = static_cast<wchar_t>(cp);
                 const int width = wcwidth(wc);
-                if (width <= 0 || x + width > frame.width ||
+                if (width <= 0 || x + width > canvas_width ||
                     offset_x + x + width > cols)
                     continue;
-                const int attr = video_attribute(caca_get_attr(frame.canvas.get(), x, y));
+                const int attr = video_attribute(caca_get_attr(canvas, x, y));
                 if (attr != last_attr) {
                     wattrset(video_window_, attr);
                     last_attr = attr;
@@ -472,10 +631,6 @@ private:
             }
         }
         wattrset(video_window_, A_NORMAL);
-        if (offset_y > 0) {
-            video_line(0, "VIDEO: " + player.entries()[player.selection()].name +
-                       "   X Stop   V Radio", PairMuted);
-        }
     }
 
     void redirect_console_logs() {
@@ -810,20 +965,46 @@ int main() {
 
         bool monitor_visible = false;
         bool video_visible = false;
+        bool camera_was_visible = false;
         bool off_requested = false;
         radio_video::Player video(radio_video::media_directory());
         std::uint64_t rendered_generation = static_cast<std::uint64_t>(-1);
+        std::uint64_t rendered_sensor_generation = static_cast<std::uint64_t>(-1);
         bool redraw = true;
         auto last_rendered = std::chrono::steady_clock::time_point{};
         while (running.load()) {
-            terminal.set_input_timeout(video_visible
-                    ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs);
+            ClientState before_input;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                before_input = state;
+            }
+            const bool camera_before_input = sensors::show_reverse_camera(
+                    before_input.direction == Direction::Reverse,
+                    monitor_visible, video_visible);
+            terminal.set_input_timeout(camera_before_input ? kCameraRefreshMs :
+                    (video_visible ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs));
             wint_t key = 0;
             const int result = terminal.read_key(key);
             if (result == KEY_CODE_YES && key == KEY_RESIZE) {
                 redraw = true;
             } else if (result == OK && (key == L'q' || key == L'Q')) {
                 running.store(false);
+            } else if (camera_before_input) {
+                // The automatic camera is not dismissible with X/ESC. Only
+                // explicitly changing the monitor/video visibility can hide it.
+                if (result == OK && (key == L'm' || key == L'M')) {
+                    monitor_visible = !monitor_visible;
+                    redraw = true;
+                } else if (result == OK && (key == L'v' || key == L'V')) {
+                    if (video_visible) {
+                        video.stop();
+                        video_visible = false;
+                    } else {
+                        video.browse();
+                        video_visible = true;
+                    }
+                    redraw = true;
+                }
             } else if (video_visible) {
                 if (result == OK && (key == L'v' || key == L'V')) {
                     video.stop();
@@ -872,8 +1053,32 @@ int main() {
                 state.refresh_engine_health(now);
                 snapshot = state;
             }
+            sensors::ClientView sensor_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(sensors_mutex);
+                sensor_snapshot = sensor_view;
+            }
             const auto now = std::chrono::steady_clock::now();
-            if (video_visible) {
+            const bool camera_visible = sensors::show_reverse_camera(
+                    snapshot.direction == Direction::Reverse,
+                    monitor_visible, video_visible);
+            if (camera_visible != camera_was_visible) {
+                if (camera_visible)
+                    video.pause(now);
+                else
+                    video.resume(now);
+                camera_was_visible = camera_visible;
+                redraw = true;
+            }
+            if (camera_visible) {
+                if (redraw || sensor_snapshot.generation() != rendered_sensor_generation ||
+                    now - last_rendered >= std::chrono::milliseconds(250)) {
+                    terminal.render_camera(sensor_snapshot, now);
+                    rendered_sensor_generation = sensor_snapshot.generation();
+                    last_rendered = now;
+                    redraw = false;
+                }
+            } else if (video_visible) {
                 const bool frame_due = video.advance(now);
                 if (redraw || frame_due) {
                     terminal.render_video(video);
@@ -903,6 +1108,13 @@ int main() {
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENT_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID);
         app->release_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
+        for (auto group : {SENSORS_CAMERA_EVENTGROUP_ID, SENSORS_ULTRASONIC_EVENTGROUP_ID,
+                           SENSORS_CAMERA_STATUS_EVENTGROUP_ID})
+            app->unsubscribe(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, group);
+        for (auto event : {SENSORS_CAMERA_FRAME_EVENT_ID, SENSORS_ULTRASONIC_EVENT_ID,
+                           SENSORS_CAMERA_STATUS_EVENT_ID})
+            app->release_event(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, event);
+        app->release_service(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID);
 
     } // Restore the terminal before the original DLT shutdown workaround.
     std::fflush(nullptr);

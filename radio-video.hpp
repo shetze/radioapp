@@ -63,6 +63,9 @@ public:
     void page(int offset);
     void select(Time now);
     void stop();
+    void pause(Time now);
+    void resume(Time now);
+    bool paused() const { return paused_; }
     bool advance(Time now); // true if the next frame should be drawn
     int wait_ms(Time now) const;
 
@@ -82,6 +85,8 @@ private:
     std::unique_ptr<Animation> animation_;
     std::size_t position_ = 0;
     Time next_frame_{};
+    Time paused_at_{};
+    bool paused_ = false;
 };
 
 } // namespace radio_video

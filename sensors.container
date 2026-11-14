@@ -1,0 +1,18 @@
+[Unit]
+Description=Simulated rear camera and ultrasonic sensor service
+Requires=routingmanagerd.socket
+After=routingmanagerd.socket
+
+[Container]
+Image=localhost/auto-apps
+Network=host
+Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+Volume=/run/vsomeip:/run/vsomeip
+Volume=/run/dlt:/run/dlt
+Exec=/usr/bin/sensors-service
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

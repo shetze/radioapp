@@ -5,6 +5,7 @@ dlt-daemon > /tmp/log/dlt-daemon.log 2>&1 &
 routingmanagerd > /tmp/log/routingmanagerd.log 2>&1 &
 
 engine-service > /tmp/log/engine.log 2>&1 &
+sensors-service > /tmp/log/sensors.log 2>&1 &
 radio-service > /tmp/log/radio.log 2>&1 &
 
 #/radio-client
