@@ -345,9 +345,9 @@ public:
                         std::cout << " reason=" << reason << " (warning >=15s)";
                     std::cout << std::endl;
                 }
-                // Start each 10s forward / 4s reverse phase after setup.
+                // Start each 20s forward / 10s reverse phase after setup.
                 phase_deadline = std::chrono::steady_clock::now()
-                        + (in_reverse ? 4s : 10s);
+                        + (in_reverse ? 10s : 20s);
                 publish_health(true);
             }
 
