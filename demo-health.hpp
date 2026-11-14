@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-// Demo-only SOME/IP health field shared by the engine service and radio client.
+// Demo-only SOME/IP health field shared by Radio, Engine and radio-client.
 // The fixed 48-byte v1 payload uses network byte order for all integer fields.
 // Unknown means the corresponding demo has not reported any measurement.
 namespace demo_health {

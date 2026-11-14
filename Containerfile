@@ -1,5 +1,17 @@
 FROM --platform=linux/arm64 quay.io/rhadp-examples/application:latest
 
+# EPEL provides libcaca-devel on AutoSD/CentOS Stream 10. The parent
+# application image already supplies the remaining build dependencies.
+RUN if [ ! -f /usr/include/caca.h ]; then \
+      if command -v dnf >/dev/null 2>&1; then \
+        dnf -y install libcaca-devel && dnf clean all; \
+      elif command -v microdnf >/dev/null 2>&1; then \
+        microdnf install -y libcaca-devel && microdnf clean all; \
+      else \
+        echo "libcaca-devel is required in the build image" >&2; exit 1; \
+      fi; \
+    fi
+
 COPY . /opt/src
 
 RUN cmake -S /opt/src -B /opt/build && \

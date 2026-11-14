@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE_EXTENDED 1
 
 #include <ncursesw/curses.h>
+#include <caca.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iomanip>
+#include <climits>
+#include <map>
+#include <utility>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -24,6 +28,7 @@
 #include <vsomeip/vsomeip.hpp>
 
 #include "radio-client-state.hpp"
+#include "radio-video.hpp"
 #include "services.hpp"
 #include "demo-health.hpp"
 
@@ -175,7 +180,8 @@ enum ColorPair {
     PairError = 3,
     PairMagenta = 4,
     PairMuted = 5,
-    PairHeading = 6
+    PairHeading = 6,
+    PairVideoFirst = 7
 };
 
 int palette_color(TextColor color) {
@@ -224,13 +230,14 @@ public:
         set_escdelay(25);
         if (has_colors()) {
             start_color();
-            use_default_colors();
-            init_pair(PairGood, COLOR_GREEN, -1);
-            init_pair(PairWarning, COLOR_YELLOW, -1);
-            init_pair(PairError, COLOR_RED, -1);
-            init_pair(PairMagenta, COLOR_MAGENTA, -1);
-            init_pair(PairMuted, COLOR_CYAN, -1);
-            init_pair(PairHeading, COLOR_WHITE, -1);
+            default_colors_ = use_default_colors() == OK;
+            const short background = default_colors_ ? -1 : COLOR_BLACK;
+            init_pair(PairGood, COLOR_GREEN, background);
+            init_pair(PairWarning, COLOR_YELLOW, background);
+            init_pair(PairError, COLOR_RED, background);
+            init_pair(PairMagenta, COLOR_MAGENTA, background);
+            init_pair(PairMuted, COLOR_CYAN, background);
+            init_pair(PairHeading, COLOR_WHITE, background);
             colors_ = true;
         }
         redirect_console_logs();
@@ -238,6 +245,8 @@ public:
     }
 
     ~Terminal() {
+        if (video_window_)
+            delwin(video_window_);
         if (screen_) {
             set_term(screen_);
             endwin();
@@ -259,6 +268,10 @@ public:
 
     int read_key(wint_t &key) const {
         return get_wch(&key);
+    }
+
+    void set_input_timeout(int milliseconds) const {
+        wtimeout(stdscr, milliseconds);
     }
 
     void render(const ClientState &s, bool monitor) const {
@@ -293,13 +306,178 @@ public:
         draw_volume(3, cols, s);
         draw_status(4, cols, s);
         draw_text(5, 1, content_width,
-                  "+/- Volume   SPACE Station   ESC Power   M Monitor   Q Quit", PairMuted);
+                  "+/- Volume   SPACE Station   ESC Power   M Monitor   V Video   Q Quit", PairMuted);
         if (monitor)
             draw_monitor(s, rows, cols);
         refresh();
     }
 
+    // Radio/monitor and video never draw into each other's windows. Video
+    // owns a single full-screen ncurses WINDOW, including the browser UI.
+    void render_video(const radio_video::Player &player) {
+        int rows = 0, cols = 0;
+        getmaxyx(stdscr, rows, cols);
+        if (rows <= 0 || cols <= 0)
+            return;
+        if (!video_window_ || rows != video_rows_ || cols != video_cols_) {
+            if (video_window_)
+                delwin(video_window_);
+            video_window_ = newwin(rows, cols, 0, 0);
+            video_rows_ = rows;
+            video_cols_ = cols;
+        }
+        if (!video_window_)
+            return;
+        werase(video_window_);
+        if (cols < radio_video::kMinimumColumns ||
+            rows < radio_video::kMinimumRows) {
+            video_line(0, "VIDEO  (X/V to return)", PairHeading, true);
+            video_line(2, "Resize terminal to at least 100x30 characters", PairWarning);
+        } else if (player.playing()) {
+            draw_video_frame(player, rows, cols);
+        } else {
+            draw_video_library(player, rows, cols);
+        }
+        wnoutrefresh(video_window_);
+        doupdate();
+    }
+
 private:
+    static std::string printable(const std::string &text) {
+        std::string result = text;
+        for (char &character : result) {
+            if (static_cast<unsigned char>(character) < 32 || character == 127)
+                character = '?';
+        }
+        return result;
+    }
+
+    void video_line(int row, const std::string &text, int color = PairNormal,
+                    bool bold = false, bool reverse = false, int column = 1) const {
+        if (!video_window_ || row < 0 || row >= video_rows_ ||
+            column < 0 || column >= video_cols_)
+            return;
+        int attrs = attribute(color, bold, reverse);
+        wattron(video_window_, attrs);
+        const std::string clean = printable(text);
+        mvwaddnstr(video_window_, row, column, clean.c_str(), video_cols_ - column);
+        wattroff(video_window_, attrs);
+    }
+
+    void draw_video_library(const radio_video::Player &player, int rows, int cols) const {
+        video_line(1, "VIDEO LIBRARY", PairHeading, true);
+        video_line(2, player.directory(), PairMuted);
+        video_line(4, "Select an animation (X stops playback):", PairNormal);
+        const auto &entries = player.entries();
+        const int slots = std::max(0, rows - 9);
+        const std::size_t visible = static_cast<std::size_t>(slots);
+        const std::size_t first = player.selection() >= visible && visible > 0
+                ? player.selection() - visible + 1 : 0;
+        for (std::size_t index = first;
+             index < entries.size() && index - first < visible; ++index) {
+            const bool chosen = index == player.selection();
+            std::string name = entries[index].name;
+            if (entries[index].directory)
+                name += "  [frames/]";
+            video_line(static_cast<int>(index - first) + 6,
+                       (chosen ? "> " : "  ") + name,
+                       chosen ? PairHeading : PairNormal, chosen, chosen, 2);
+        }
+        if (entries.empty() && player.message().empty())
+            video_line(6, "No animations found", PairWarning);
+        if (!player.message().empty())
+            video_line(rows - 3, player.message(), PairWarning);
+        video_line(rows - 1,
+                   "UP/DOWN Select   ENTER Play   R Reload   V/ESC/X Radio   Q Quit",
+                   PairMuted);
+        (void)cols;
+    }
+
+    // libcaca uses the 16 DOS ANSI colour IDs (BGR), whereas curses uses
+    // the conventional RGB numbering. Allocate pairs lazily for the media.
+    int video_color(unsigned c, bool foreground) const {
+        static const short caca_to_curses[] = {
+            COLOR_BLACK, COLOR_BLUE, COLOR_GREEN, COLOR_CYAN,
+            COLOR_RED, COLOR_MAGENTA, COLOR_YELLOW, COLOR_WHITE
+        };
+        if (c >= 16)
+            return default_colors_ ? -1 : (foreground ? COLOR_WHITE : COLOR_BLACK);
+        int mapped = caca_to_curses[c % 8];
+        if (c >= 8 && COLORS >= 16)
+            mapped += 8;
+        return mapped;
+    }
+
+    int video_attribute(std::uint32_t caca_attr) {
+        if (!colors_)
+            return 0;
+        const unsigned fg = caca_attr_to_ansi_fg(caca_attr);
+        const unsigned bg = caca_attr_to_ansi_bg(caca_attr);
+        const int foreground = video_color(fg, true);
+        const int background = video_color(bg, false);
+        const auto key = std::make_pair(foreground, background);
+        auto found = video_pairs_.find(key);
+        short pair = 0;
+        if (found != video_pairs_.end()) {
+            pair = found->second;
+        } else if (next_video_pair_ < COLOR_PAIRS && next_video_pair_ < SHRT_MAX) {
+            const short candidate = static_cast<short>(next_video_pair_);
+            if (init_pair(candidate, static_cast<short>(foreground),
+                          static_cast<short>(background)) == OK) {
+                pair = candidate;
+                video_pairs_.emplace(key, pair);
+                ++next_video_pair_;
+            }
+        }
+        return COLOR_PAIR(pair) | (fg >= 8 && fg < 16 && COLORS < 16 ? A_BOLD : 0);
+    }
+
+    void draw_video_frame(const radio_video::Player &player, int rows, int cols) {
+        const auto *animation = player.animation();
+        const int need_cols = std::max(radio_video::kMinimumColumns, animation->width());
+        const int need_rows = std::max(radio_video::kMinimumRows, animation->height());
+        if (cols < need_cols || rows < need_rows) {
+            video_line(1, "VIDEO: " + player.entries()[player.selection()].name,
+                       PairHeading, true);
+            video_line(3, "This animation requires a terminal of at least " +
+                       std::to_string(need_cols) + "x" + std::to_string(need_rows),
+                       PairWarning);
+            video_line(5, "Resize the terminal, or press X to select another video.");
+            return;
+        }
+        const auto &frame = player.current_frame();
+        caca_set_frame(frame.canvas.get(), frame.index);
+        const int offset_x = (cols - animation->width()) / 2;
+        const int offset_y = (rows - animation->height()) / 2;
+        int last_attr = -1;
+        for (int y = 0; y < frame.height; ++y) {
+            for (int x = 0; x < frame.width; ++x) {
+                const std::uint32_t cp = caca_get_char(frame.canvas.get(), x, y);
+                // libcaca marks the second cell of a wide character with
+                // an internal sentinel. ncursesw draws it automatically.
+                if (cp == CACA_MAGIC_FULLWIDTH || cp < 32 || cp > 0x10ffff)
+                    continue;
+                const wchar_t wc = static_cast<wchar_t>(cp);
+                const int width = wcwidth(wc);
+                if (width <= 0 || x + width > frame.width ||
+                    offset_x + x + width > cols)
+                    continue;
+                const int attr = video_attribute(caca_get_attr(frame.canvas.get(), x, y));
+                if (attr != last_attr) {
+                    wattrset(video_window_, attr);
+                    last_attr = attr;
+                }
+                const wchar_t text[2] = {wc, 0};
+                mvwaddnwstr(video_window_, offset_y + y, offset_x + x, text, 1);
+            }
+        }
+        wattrset(video_window_, A_NORMAL);
+        if (offset_y > 0) {
+            video_line(0, "VIDEO: " + player.entries()[player.selection()].name +
+                       "   X Stop   V Radio", PairMuted);
+        }
+    }
+
     void redirect_console_logs() {
         const char *path = std::getenv("RADIO_CLIENT_LOG_FILE");
         if (!path)
@@ -565,6 +743,12 @@ private:
         }
     }
 
+    WINDOW *video_window_ = nullptr;
+    int video_rows_ = 0;
+    int video_cols_ = 0;
+    int next_video_pair_ = PairVideoFirst;
+    std::map<std::pair<int, int>, short> video_pairs_;
+    bool default_colors_ = false;
     SCREEN *screen_ = nullptr;
     FILE *screen_output_ = nullptr;
     int saved_stdout_ = -1;
@@ -625,20 +809,61 @@ int main() {
         });
 
         bool monitor_visible = false;
+        bool video_visible = false;
         bool off_requested = false;
+        radio_video::Player video(radio_video::media_directory());
         std::uint64_t rendered_generation = static_cast<std::uint64_t>(-1);
         bool redraw = true;
         auto last_rendered = std::chrono::steady_clock::time_point{};
         while (running.load()) {
+            terminal.set_input_timeout(video_visible
+                    ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs);
             wint_t key = 0;
             const int result = terminal.read_key(key);
-            if (result == KEY_CODE_YES && key == KEY_RESIZE)
+            if (result == KEY_CODE_YES && key == KEY_RESIZE) {
                 redraw = true;
-            else if (result == OK) {
-                handle_key(key, monitor_visible, off_requested);
+            } else if (result == OK && (key == L'q' || key == L'Q')) {
+                running.store(false);
+            } else if (video_visible) {
+                if (result == OK && (key == L'v' || key == L'V')) {
+                    video.stop();
+                    video_visible = false;
+                    redraw = true;
+                } else if (result == OK && (key == L'x' || key == L'X' || key == 27)) {
+                    if (video.playing())
+                        video.stop();
+                    else
+                        video_visible = false;
+                    redraw = true;
+                } else if (!video.playing()) {
+                    if (result == KEY_CODE_YES && key == KEY_UP) {
+                        video.move(-1); redraw = true;
+                    } else if (result == KEY_CODE_YES && key == KEY_DOWN) {
+                        video.move(1); redraw = true;
+                    } else if (result == KEY_CODE_YES && key == KEY_PPAGE) {
+                        video.page(-10); redraw = true;
+                    } else if (result == KEY_CODE_YES && key == KEY_NPAGE) {
+                        video.page(10); redraw = true;
+                    } else if ((result == KEY_CODE_YES && key == KEY_ENTER) ||
+                               (result == OK && (key == L'\n' || key == L'\r'))) {
+                        video.select(std::chrono::steady_clock::now());
+                        redraw = true;
+                    } else if (result == OK && (key == L'r' || key == L'R')) {
+                        video.browse(); redraw = true;
+                    }
+                }
+            } else if (result == OK) {
+                if (key == L'v' || key == L'V') {
+                    video.browse();
+                    video_visible = true;
+                } else {
+                    handle_key(key, monitor_visible, off_requested);
+                }
                 redraw = true;
             }
 
+            // Continue receiving and aging telemetry while the video overlay
+            // is visible. No video operation sends radio control messages.
             ClientState snapshot;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
@@ -648,8 +873,14 @@ int main() {
                 snapshot = state;
             }
             const auto now = std::chrono::steady_clock::now();
-            if (redraw || snapshot.generation != rendered_generation ||
-                (monitor_visible && now - last_rendered >= std::chrono::seconds(1))) {
+            if (video_visible) {
+                const bool frame_due = video.advance(now);
+                if (redraw || frame_due) {
+                    terminal.render_video(video);
+                    redraw = false;
+                }
+            } else if (redraw || snapshot.generation != rendered_generation ||
+                       (monitor_visible && now - last_rendered >= std::chrono::seconds(1))) {
                 terminal.render(snapshot, monitor_visible);
                 rendered_generation = snapshot.generation;
                 last_rendered = now;
